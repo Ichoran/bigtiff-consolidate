@@ -1,0 +1,12 @@
+[package]
+name = "bigtiff-strip"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+simd-json = "0.14"
+zip = { version = "2.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true

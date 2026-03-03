@@ -358,6 +358,91 @@ fn encode_offsets(offsets: &[u64]) -> (u16, Vec<u8>) {
     (typ, data)
 }
 
+fn extract_image_dimensions(entries: &[IfdEntry]) -> (u32, u32, u16) {
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut bits = 16u16;
+
+    for entry in entries {
+        match entry.tag {
+            256 => { // ImageWidth
+                width = u32::from_le_bytes([
+                    entry.value_or_offset[0],
+                    entry.value_or_offset[1],
+                    entry.value_or_offset[2],
+                    entry.value_or_offset[3],
+                ]);
+            }
+            257 => { // ImageLength
+                height = u32::from_le_bytes([
+                    entry.value_or_offset[0],
+                    entry.value_or_offset[1],
+                    entry.value_or_offset[2],
+                    entry.value_or_offset[3],
+                ]);
+            }
+            258 => { // BitsPerSample
+                bits = u16::from_le_bytes([
+                    entry.value_or_offset[0],
+                    entry.value_or_offset[1],
+                ]);
+            }
+            _ => {}
+        }
+    }
+
+    (width, height, bits)
+}
+
+fn generate_ome_xml(width: u32, height: u32, num_z: u64, bits: u16) -> String {
+    let pixel_type = match bits {
+        8 => "uint8",
+        16 => "uint16",
+        32 => "uint32",
+        _ => "uint16",
+    };
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">
+  <Image ID="Image:0" Name="image">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="{}"
+            SizeX="{}" SizeY="{}" SizeZ="{}" SizeC="1" SizeT="1"
+            BigEndian="false" Interleaved="false">
+      <Channel ID="Channel:0:0" SamplesPerPixel="1"/>
+      <TiffData IFD="0" PlaneCount="{}"/>
+    </Pixels>
+  </Image>
+</OME>"#,
+        pixel_type, width, height, num_z, num_z
+    )
+}
+
+fn create_ome_description_entry(ome_xml: &str, writer: &mut BigTiffWriter) -> io::Result<IfdEntry> {
+    let mut data = ome_xml.as_bytes().to_vec();
+    data.push(0); // null terminator
+
+    let count = data.len() as u64;
+    let mut entry = IfdEntry {
+        tag: 270, // ImageDescription
+        typ: 2,   // ASCII
+        count,
+        value_or_offset: [0u8; 8],
+    };
+
+    if data.len() <= 8 {
+        entry.value_or_offset[..data.len()].copy_from_slice(&data);
+    } else {
+        writer.align(8)?;
+        let offset = writer.write_bytes(&data)?;
+        entry.value_or_offset = offset.to_le_bytes();
+    }
+
+    Ok(entry)
+}
+
 fn extract_metadata(entries: &[IfdEntry], reader: &mut BigTiffReader) -> io::Result<HashMap<&'static str, String>> {
     let mut metadata = HashMap::new();
 
@@ -425,7 +510,7 @@ fn metadata_to_json_line(metadata: &HashMap<&'static str, String>) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
-fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Path>) -> io::Result<()> {
+fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Path>, use_ome: bool) -> io::Result<()> {
     let mut reader = BigTiffReader::open(input_path)?;
     let mut writer = BigTiffWriter::create(output_path)?;
 
@@ -439,11 +524,17 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
     // First pass: collect all IFD info and metadata
     let mut all_ifds: Vec<(Vec<IfdEntry>, Vec<u64>, Vec<u64>)> = Vec::new();
     let mut all_metadata: Vec<HashMap<&'static str, String>> = Vec::new();
+    let mut image_dims: Option<(u32, u32, u16)> = None;
 
     eprintln!("Reading IFDs...");
     while ifd_offset != 0 {
         let (entries, next_ifd) = reader.read_ifd(ifd_offset)?;
         let (offsets, counts) = get_offsets_and_counts(&entries, &mut reader)?;
+
+        // Get dimensions from first IFD
+        if image_dims.is_none() {
+            image_dims = Some(extract_image_dimensions(&entries));
+        }
 
         // Extract metadata before filtering
         let metadata = extract_metadata(&entries, &mut reader)?;
@@ -465,7 +556,8 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
         ifd_offset = next_ifd;
     }
 
-    eprintln!("Total IFDs: {}", ifd_count);
+    let (width, height, bits) = image_dims.unwrap_or((0, 0, 16));
+    eprintln!("Total IFDs: {} ({}x{}, {}-bit)", ifd_count, width, height, bits);
 
     // Write metadata JSON if path provided
     if let Some(meta_path) = metadata_path {
@@ -487,10 +579,19 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
         .unwrap_or(0);
     let mut strip_buf = vec![0u8; max_strip_size as usize];
 
+    // Generate OME-XML if requested
+    let ome_xml = if use_ome {
+        let xml = generate_ome_xml(width, height, ifd_count, bits);
+        eprintln!("Generated OME-XML ({} bytes)", xml.len());
+        Some(xml)
+    } else {
+        None
+    };
+
     // Process each IFD
     let mut written_ifds = 0u64;
 
-    for (entries, src_offsets, src_counts) in all_ifds.iter() {
+    for (ifd_idx, (entries, src_offsets, src_counts)) in all_ifds.iter().enumerate() {
         // Write strip/tile data first
         let mut new_offsets = Vec::with_capacity(src_offsets.len());
 
@@ -561,6 +662,14 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
             new_entries.push(new_entry);
         }
 
+        // Add OME-XML to first IFD only
+        if ifd_idx == 0 {
+            if let Some(ref xml) = ome_xml {
+                let ome_entry = create_ome_description_entry(xml, &mut writer)?;
+                new_entries.push(ome_entry);
+            }
+        }
+
         // Sort entries by tag (TIFF requirement)
         new_entries.sort_by_key(|e| e.tag);
 
@@ -590,16 +699,37 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
     Ok(())
 }
 
+fn print_usage(program: &str) {
+    eprintln!("Usage: {} [-ome] <input.tiff>", program);
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -ome     Create OME-TIFF with proper OME-XML metadata");
+    eprintln!("           (helps ImageJ load faster by providing metadata upfront)");
+    eprintln!();
+    eprintln!("Creates:");
+    eprintln!("  <input>_plain.tiff     - BigTIFF with metadata stripped (default)");
+    eprintln!("  <input>.ome.tiff       - OME-TIFF with minimal OME-XML (-ome)");
+    eprintln!("  <input>_metadata.json  - Extracted metadata (one JSON per line)");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() != 2 {
-        eprintln!("Usage: {} <input.tiff>", args[0]);
-        eprintln!("Creates <input>_plain.tiff with metadata stripped");
-        process::exit(1);
+    let (use_ome, input_arg) = match args.len() {
+        2 => (false, &args[1]),
+        3 if args[1] == "-ome" => (true, &args[2]),
+        _ => {
+            print_usage(&args[0]);
+            process::exit(1);
+        }
+    };
+
+    if input_arg == "-h" || input_arg == "--help" {
+        print_usage(&args[0]);
+        process::exit(0);
     }
 
-    let input_path = Path::new(&args[1]);
+    let input_path = Path::new(input_arg);
 
     if !input_path.exists() {
         eprintln!("Error: Input file does not exist: {}", input_path.display());
@@ -617,7 +747,11 @@ fn main() {
         .unwrap_or("tiff");
     let parent = input_path.parent().unwrap_or(Path::new("."));
 
-    let output_name = format!("{}_plain.{}", stem, extension);
+    let output_name = if use_ome {
+        format!("{}.ome.tiff", stem)
+    } else {
+        format!("{}_plain.{}", stem, extension)
+    };
     let output_path = parent.join(&output_name);
 
     let metadata_name = format!("{}_metadata.json", stem);
@@ -638,8 +772,11 @@ fn main() {
 
     eprintln!("Input:  {}", input_path.display());
     eprintln!("Output: {}", output_path.display());
+    if use_ome {
+        eprintln!("Mode:   OME-TIFF");
+    }
 
-    if let Err(e) = process_file(input_path, &output_path, write_metadata) {
+    if let Err(e) = process_file(input_path, &output_path, write_metadata, use_ome) {
         eprintln!("Error: {}", e);
         // Try to clean up partial output
         let _ = std::fs::remove_file(&output_path);
