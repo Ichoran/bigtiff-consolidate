@@ -1,14 +1,11 @@
-//! BigTIFF metadata stripper
+//! BigTIFF IFD consolidator
 //!
-//! Reads a BigTIFF file and writes a new one with metadata tags removed
-//! (ImageDescription, Software, etc.) to improve loading performance in
-//! applications like ImageJ that have O(n^2) metadata processing.
-//!
-//! Metadata is preserved in a separate JSON file (_metadata.json).
+//! Consolidates IFDs to the end of file for fast network access.
+//! Optionally strips metadata or creates OME-TIFF format.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process;
@@ -510,7 +507,107 @@ fn metadata_to_json_line(metadata: &HashMap<&'static str, String>) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
-fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Path>, use_ome: bool) -> io::Result<()> {
+/// Check if IFDs are already consolidated at the end of the file.
+///
+/// In a consolidated file: all image data at low addresses, all IFDs at high addresses.
+/// In an interleaved file: IFDs and image data are mixed throughout.
+///
+/// We track IFD positions in a sorted set and max(image_end) as we scan. A crossing
+/// occurs when:
+/// - A new IFD appears before max(image_end) seen so far
+/// - New image data extends past any IFD position (those IFDs are removed as outliers)
+///
+/// This allows a small number of "out of place" IFDs (e.g., the first IFD at the
+/// beginning of the file) without triggering a full rewrite.
+///
+/// If we see more than `allowed_crossings` crossings, the file is interleaved.
+fn check_ifds_consolidated(reader: &mut BigTiffReader, allowed_crossings: u32) -> io::Result<bool> {
+    let mut ifd_offset = reader.first_ifd_offset()?;
+
+    // Track IFD positions in sorted order so we can remove outliers
+    let mut ifd_positions: BTreeSet<u64> = BTreeSet::new();
+    let mut max_image_end: u64 = 0;
+    let mut crossings: u32 = 0;
+
+    while ifd_offset != 0 {
+        // Check if this IFD is before any image data we've seen (crossing)
+        if ifd_offset < max_image_end {
+            crossings += 1;
+            if crossings > allowed_crossings {
+                return Ok(false);
+            }
+            // Don't add this IFD to the set - it's already counted as out of place
+        } else {
+            // Add this IFD position to our sorted set
+            ifd_positions.insert(ifd_offset);
+        }
+
+        let (entries, next_ifd) = reader.read_ifd(ifd_offset)?;
+        let (offsets, counts) = get_offsets_and_counts(&entries, reader)?;
+
+        // Check each image data block
+        for (&off, &cnt) in offsets.iter().zip(counts.iter()) {
+            let end = off + cnt;
+
+            // Remove any IFDs that are below this image data end
+            // (they are "out of place" - in the image data region)
+            while let Some(&min_ifd) = ifd_positions.first() {
+                if min_ifd < end {
+                    ifd_positions.pop_first();
+                    crossings += 1;
+                    if crossings > allowed_crossings {
+                        return Ok(false);
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Update max image end
+            if end > max_image_end {
+                max_image_end = end;
+            }
+        }
+
+        ifd_offset = next_ifd;
+    }
+
+    Ok(true)
+}
+
+/// Check if we can rename on this filesystem (same device).
+/// Returns true if the source and destination would be on the same mount point.
+fn can_rename_in_place(path: &Path) -> bool {
+    // Try to get the parent directory
+    let parent = path.parent().unwrap_or(Path::new("."));
+
+    // On Unix, we can check device IDs
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(src_meta), Ok(dst_meta)) = (path.metadata(), parent.metadata()) {
+            return src_meta.dev() == dst_meta.dev();
+        }
+    }
+
+    // Default: assume we can rename (same directory)
+    true
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Consolidate, // Default: just consolidate IFDs, preserve all data
+    Plain,       // Strip metadata, output _plain.tiff
+    Ome,         // Strip metadata, add OME-XML, output .ome.tiff
+}
+
+/// Process file: consolidate IFDs to end, optionally strip metadata.
+fn process_file(
+    input_path: &Path,
+    output_path: &Path,
+    metadata_path: Option<&Path>,
+    mode: Mode,
+) -> io::Result<()> {
     let mut reader = BigTiffReader::open(input_path)?;
     let mut writer = BigTiffWriter::create(output_path)?;
 
@@ -535,15 +632,23 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
             image_dims = Some(extract_image_dimensions(&entries));
         }
 
-        // Extract metadata before filtering
-        let metadata = extract_metadata(&entries, &mut reader)?;
-        all_metadata.push(metadata);
+        // Extract metadata before filtering (for JSON export)
+        if mode != Mode::Consolidate {
+            let metadata = extract_metadata(&entries, &mut reader)?;
+            all_metadata.push(metadata);
+        }
 
-        // Filter to only keep essential tags (exclude metadata tags)
-        let filtered: Vec<IfdEntry> = entries
-            .into_iter()
-            .filter(|e| keep_tags.contains(&e.tag) && !metadata_tag_set.contains(&e.tag))
-            .collect();
+        // Filter entries based on mode
+        let filtered: Vec<IfdEntry> = if mode == Mode::Consolidate {
+            // Keep all entries
+            entries
+        } else {
+            // Strip metadata tags
+            entries
+                .into_iter()
+                .filter(|e| keep_tags.contains(&e.tag) && !metadata_tag_set.contains(&e.tag))
+                .collect()
+        };
 
         all_ifds.push((filtered, offsets, counts));
 
@@ -558,7 +663,7 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
     let (width, height, bits) = image_dims.unwrap_or((0, 0, 16));
     eprintln!("Total IFDs: {} ({}x{}, {}-bit)", ifd_count, width, height, bits);
 
-    // Write metadata JSON if path provided
+    // Write metadata JSON if path provided (only for -plain and -ome modes)
     if let Some(meta_path) = metadata_path {
         eprintln!("Writing metadata to {}...", meta_path.display());
         let mut meta_file = BufWriter::new(File::create(meta_path)?);
@@ -569,7 +674,7 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
     }
 
     // Generate OME-XML if requested
-    let ome_xml = if use_ome {
+    let ome_xml = if mode == Mode::Ome {
         let xml = generate_ome_xml(width, height, ifd_count, bits);
         eprintln!("Generated OME-XML ({} bytes)", xml.len());
         Some(xml)
@@ -631,8 +736,6 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
 
             if entry.tag == 273 || entry.tag == 324 {
                 // StripOffsets or TileOffsets - update with new offsets
-                // For contiguous IFDs, we inline if possible, else the offset data
-                // was already written with the image data - but we need to write it here
                 let (typ, data) = encode_offsets(new_offsets);
                 new_entry.typ = typ;
                 new_entry.count = new_offsets.len() as u64;
@@ -664,7 +767,7 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
             new_entries.push(new_entry);
         }
 
-        // Add OME-XML to first IFD only
+        // Add OME-XML to first IFD only (for -ome mode)
         if ifd_idx == 0 {
             if let Some(ref xml) = ome_xml {
                 let ome_entry = create_ome_description_entry(xml, &mut writer)?;
@@ -708,35 +811,80 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
     Ok(())
 }
 
+const DEFAULT_ALLOWED_CROSSINGS: u32 = 10;
+
 fn print_usage(program: &str) {
-    eprintln!("Usage: {} [-ome] <input.tiff>", program);
+    eprintln!("Usage: {} [OPTIONS] <input.tiff>", program);
+    eprintln!();
+    eprintln!("Consolidates BigTIFF IFDs to end of file for fast network access.");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  -ome     Create OME-TIFF with proper OME-XML metadata");
-    eprintln!("           (helps ImageJ load faster by providing metadata upfront)");
+    eprintln!("  (none)   Consolidate IFDs to end, preserve all metadata");
+    eprintln!("           If rename is possible: renames original to *_original.tiff");
+    eprintln!("           If rename not possible: writes to *_copy.tiff");
+    eprintln!("  -plain   Strip metadata, write to *_plain.tiff and *_metadata.json");
+    eprintln!("  -ome     Create OME-TIFF, write to *.ome.tiff and *_metadata.json");
+    eprintln!("  -c N     Allowed out-of-place IFDs before rewriting (default: {}, min: 1)", DEFAULT_ALLOWED_CROSSINGS);
     eprintln!();
-    eprintln!("Creates:");
-    eprintln!("  <input>_plain.tiff     - BigTIFF with metadata stripped (default)");
-    eprintln!("  <input>.ome.tiff       - OME-TIFF with minimal OME-XML (-ome)");
-    eprintln!("  <input>_metadata.json  - Extracted metadata (one JSON per line)");
+    eprintln!("Exit codes:");
+    eprintln!("  0  Success (or file already consolidated)");
+    eprintln!("  1  Error");
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let (use_ome, input_arg) = match args.len() {
-        2 => (false, &args[1]),
-        3 if args[1] == "-ome" => (true, &args[2]),
-        _ => {
+    // Parse arguments
+    let mut mode = Mode::Consolidate;
+    let mut allowed_crossings = DEFAULT_ALLOWED_CROSSINGS;
+    let mut input_arg: Option<&String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_usage(&args[0]);
+                process::exit(0);
+            }
+            "-plain" => mode = Mode::Plain,
+            "-ome" => mode = Mode::Ome,
+            "-c" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: -c requires a number");
+                    process::exit(1);
+                }
+                allowed_crossings = match args[i].parse::<u32>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => {
+                        eprintln!("Error: -c requires a positive integer (min 1)");
+                        process::exit(1);
+                    }
+                };
+            }
+            arg if arg.starts_with('-') => {
+                eprintln!("Error: Unknown option: {}", arg);
+                print_usage(&args[0]);
+                process::exit(1);
+            }
+            _ => {
+                if input_arg.is_some() {
+                    eprintln!("Error: Multiple input files specified");
+                    process::exit(1);
+                }
+                input_arg = Some(&args[i]);
+            }
+        }
+        i += 1;
+    }
+
+    let input_arg = match input_arg {
+        Some(arg) => arg,
+        None => {
             print_usage(&args[0]);
             process::exit(1);
         }
     };
-
-    if input_arg == "-h" || input_arg == "--help" {
-        print_usage(&args[0]);
-        process::exit(0);
-    }
 
     let input_path = Path::new(input_arg);
 
@@ -745,7 +893,25 @@ fn main() {
         process::exit(1);
     }
 
-    // Generate output filenames
+    // Check if already consolidated (only in default mode)
+    if mode == Mode::Consolidate {
+        eprintln!("Checking if IFDs are already consolidated (tolerance: {} crossings)...", allowed_crossings);
+        match BigTiffReader::open(input_path).and_then(|mut r| check_ifds_consolidated(&mut r, allowed_crossings)) {
+            Ok(true) => {
+                eprintln!("File is already consolidated (IFDs at end). Nothing to do.");
+                process::exit(0);
+            }
+            Ok(false) => {
+                eprintln!("IFDs are interleaved with image data. Consolidating...");
+            }
+            Err(e) => {
+                eprintln!("Error checking file: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    // Generate output filenames based on mode
     let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -756,42 +922,122 @@ fn main() {
         .unwrap_or("tiff");
     let parent = input_path.parent().unwrap_or(Path::new("."));
 
-    let output_name = if use_ome {
-        format!("{}.ome.tiff", stem)
-    } else {
-        format!("{}_plain.{}", stem, extension)
+    let (output_path, backup_path, metadata_path) = match mode {
+        Mode::Consolidate => {
+            // Check if we can rename in place
+            if can_rename_in_place(input_path) {
+                // Will rename original to _original, write consolidated to original name
+                let backup_name = format!("{}_original.{}", stem, extension);
+                let backup_path = parent.join(&backup_name);
+                (input_path.to_path_buf(), Some(backup_path), None)
+            } else {
+                // Write to _copy, leave original in place
+                let output_name = format!("{}_copy.{}", stem, extension);
+                let output_path = parent.join(&output_name);
+                (output_path, None, None)
+            }
+        }
+        Mode::Plain => {
+            let output_name = format!("{}_plain.{}", stem, extension);
+            let metadata_name = format!("{}_metadata.json", stem);
+            (
+                parent.join(&output_name),
+                None,
+                Some(parent.join(&metadata_name)),
+            )
+        }
+        Mode::Ome => {
+            let output_name = format!("{}.ome.tiff", stem);
+            let metadata_name = format!("{}_metadata.json", stem);
+            (
+                parent.join(&output_name),
+                None,
+                Some(parent.join(&metadata_name)),
+            )
+        }
     };
-    let output_path = parent.join(&output_name);
 
-    let metadata_name = format!("{}_metadata.json", stem);
-    let metadata_path = parent.join(&metadata_name);
+    // Handle consolidate mode with rename
+    let actual_output_path = if mode == Mode::Consolidate && backup_path.is_some() {
+        let backup = backup_path.as_ref().unwrap();
 
-    if output_path.exists() {
-        eprintln!("Error: Output file already exists: {}", output_path.display());
-        process::exit(1);
-    }
+        if backup.exists() {
+            eprintln!("Error: Backup file already exists: {}", backup.display());
+            process::exit(1);
+        }
+
+        // Create temporary output file
+        let temp_name = format!("{}_consolidating.{}", stem, extension);
+        let temp_path = parent.join(&temp_name);
+
+        if temp_path.exists() {
+            eprintln!("Error: Temporary file already exists: {}", temp_path.display());
+            process::exit(1);
+        }
+
+        temp_path
+    } else {
+        if output_path.exists() {
+            eprintln!("Error: Output file already exists: {}", output_path.display());
+            process::exit(1);
+        }
+        output_path.clone()
+    };
 
     // Check if metadata file exists (skip writing if so)
-    let write_metadata = if metadata_path.exists() {
-        eprintln!("Metadata file already exists, skipping: {}", metadata_path.display());
-        None
+    let write_metadata = if let Some(ref meta_path) = metadata_path {
+        if meta_path.exists() {
+            eprintln!("Metadata file already exists, skipping: {}", meta_path.display());
+            None
+        } else {
+            Some(meta_path.as_path())
+        }
     } else {
-        Some(metadata_path.as_path())
+        None
     };
 
     eprintln!("Input:  {}", input_path.display());
-    eprintln!("Output: {}", output_path.display());
-    if use_ome {
-        eprintln!("Mode:   OME-TIFF");
+    eprintln!("Output: {}", actual_output_path.display());
+    match mode {
+        Mode::Consolidate => {
+            if let Some(ref backup) = backup_path {
+                eprintln!("Backup: {}", backup.display());
+            }
+            eprintln!("Mode:   Consolidate (preserve all data)");
+        }
+        Mode::Plain => eprintln!("Mode:   Plain (strip metadata)"),
+        Mode::Ome => eprintln!("Mode:   OME-TIFF"),
     }
 
-    if let Err(e) = process_file(input_path, &output_path, write_metadata, use_ome) {
+    if let Err(e) = process_file(input_path, &actual_output_path, write_metadata, mode) {
         eprintln!("Error: {}", e);
         // Try to clean up partial output
-        let _ = std::fs::remove_file(&output_path);
-        if write_metadata.is_some() {
-            let _ = std::fs::remove_file(&metadata_path);
+        let _ = fs::remove_file(&actual_output_path);
+        if let Some(meta_path) = write_metadata {
+            let _ = fs::remove_file(meta_path);
         }
         process::exit(1);
+    }
+
+    // For consolidate mode with rename: do the rename dance
+    if mode == Mode::Consolidate {
+        if let Some(ref backup) = backup_path {
+            eprintln!("Renaming original to backup...");
+            if let Err(e) = fs::rename(input_path, backup) {
+                eprintln!("Error renaming original to backup: {}", e);
+                eprintln!("Consolidated file is at: {}", actual_output_path.display());
+                process::exit(1);
+            }
+
+            eprintln!("Renaming consolidated to original name...");
+            if let Err(e) = fs::rename(&actual_output_path, input_path) {
+                eprintln!("Error renaming consolidated file: {}", e);
+                eprintln!("Backup is at: {}", backup.display());
+                eprintln!("Consolidated file is at: {}", actual_output_path.display());
+                process::exit(1);
+            }
+
+            eprintln!("Success! Original backed up to: {}", backup.display());
+        }
     }
 }
