@@ -90,6 +90,12 @@ The binary will be at `target/release/bigtiff-consolidate`.
 - Image data is copied directly without re-encoding
 - Exit code 0 if file is already consolidated (no action needed)
 
+## CAUTION
+
+- Check output validity before deleting valuable data.
+- Not tested on compressed TIFFs.  Don't expect it to work.
+- Not tested with custom tags.  If you use atypical tags for anything important, check them!
+
 ## Prevention
 
 If you're generating files with tifffile, use `contiguous=True` to write
