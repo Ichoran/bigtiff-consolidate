@@ -519,7 +519,6 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
 
     let mut ifd_offset = reader.first_ifd_offset()?;
     let mut ifd_count = 0u64;
-    let mut prev_ifd_offset: Option<(u64, u64)> = None; // (offset, num_entries)
 
     // First pass: collect all IFD info and metadata
     let mut all_ifds: Vec<(Vec<IfdEntry>, Vec<u64>, Vec<u64>)> = Vec::new();
@@ -568,16 +567,6 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
         }
         meta_file.flush()?;
     }
-    eprintln!("Writing output...");
-
-    // Allocate a buffer for strip data (reuse across strips)
-    let max_strip_size: u64 = all_ifds
-        .iter()
-        .flat_map(|(_, _, counts)| counts.iter())
-        .copied()
-        .max()
-        .unwrap_or(0);
-    let mut strip_buf = vec![0u8; max_strip_size as usize];
 
     // Generate OME-XML if requested
     let ome_xml = if use_ome {
@@ -588,75 +577,88 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
         None
     };
 
-    // Process each IFD
-    let mut written_ifds = 0u64;
+    // Allocate a buffer for strip data (reuse across strips)
+    let max_strip_size: u64 = all_ifds
+        .iter()
+        .flat_map(|(_, _, counts)| counts.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut strip_buf = vec![0u8; max_strip_size as usize];
 
-    for (ifd_idx, (entries, src_offsets, src_counts)) in all_ifds.iter().enumerate() {
-        // Write strip/tile data first
+    // =======================================================================
+    // PHASE 1: Write all image data first (contiguously)
+    // =======================================================================
+    eprintln!("Writing image data...");
+    let mut all_new_offsets: Vec<Vec<u64>> = Vec::with_capacity(all_ifds.len());
+    let mut written_images = 0u64;
+
+    for (_entries, src_offsets, src_counts) in all_ifds.iter() {
         let mut new_offsets = Vec::with_capacity(src_offsets.len());
 
         for (&src_off, &count) in src_offsets.iter().zip(src_counts.iter()) {
-            writer.align(2)?; // Align to word boundary
+            writer.align(2)?;
             let new_off = writer.current_position();
             reader.read_strip_data(src_off, count, &mut strip_buf)?;
             writer.write_bytes(&strip_buf[..count as usize])?;
             new_offsets.push(new_off);
         }
 
-        // Build new entries with updated offsets
-        let mut new_entries: Vec<IfdEntry> = Vec::with_capacity(entries.len());
+        all_new_offsets.push(new_offsets);
+        written_images += 1;
 
-        // First, write any external tag data and collect entries
-        let mut external_data: HashMap<u16, (u64, Vec<u8>)> = HashMap::new();
-
-        for entry in entries {
-            if entry.tag == 273 || entry.tag == 324 {
-                // StripOffsets or TileOffsets - will update with new offsets
-                let (_, data) = encode_offsets(&new_offsets);
-                if data.len() > 8 {
-                    writer.align(8)?;
-                    let offset = writer.write_bytes(&data)?;
-                    external_data.insert(entry.tag, (offset, data));
-                } else {
-                    external_data.insert(entry.tag, (0, data));
-                }
-            } else if entry.tag == 279 || entry.tag == 325 {
-                // StripByteCounts or TileByteCounts - unchanged
-                if !entry.is_inline() {
-                    let data = reader.read_value_data(entry)?;
-                    writer.align(8)?;
-                    let offset = writer.write_bytes(&data)?;
-                    external_data.insert(entry.tag, (offset, data));
-                }
-            } else if !entry.is_inline() {
-                // Other external data - copy as-is
-                let data = reader.read_value_data(entry)?;
-                writer.align(8)?;
-                let offset = writer.write_bytes(&data)?;
-                external_data.insert(entry.tag, (offset, data));
-            }
+        if written_images % 1000 == 0 {
+            eprintln!("  Written {} images...", written_images);
         }
+    }
 
-        // Now build the actual entries
+    // =======================================================================
+    // PHASE 2: Write all IFDs at the end (contiguously) for fast network access
+    // =======================================================================
+    eprintln!("Writing IFDs at end of file...");
+    writer.align(8)?;
+
+    let mut ifd_infos: Vec<(u64, u64)> = Vec::with_capacity(all_ifds.len()); // (offset, num_entries)
+
+    for (ifd_idx, (entries, _src_offsets, _src_counts)) in all_ifds.iter().enumerate() {
+        let new_offsets = &all_new_offsets[ifd_idx];
+
+        // Build new entries with updated offsets
+        let mut new_entries: Vec<IfdEntry> = Vec::with_capacity(entries.len() + 1);
+
         for entry in entries {
             let mut new_entry = entry.clone();
 
             if entry.tag == 273 || entry.tag == 324 {
-                // Update offsets
-                let (typ, data) = encode_offsets(&new_offsets);
+                // StripOffsets or TileOffsets - update with new offsets
+                // For contiguous IFDs, we inline if possible, else the offset data
+                // was already written with the image data - but we need to write it here
+                let (typ, data) = encode_offsets(new_offsets);
                 new_entry.typ = typ;
                 new_entry.count = new_offsets.len() as u64;
                 if data.len() <= 8 {
                     new_entry.value_or_offset = [0u8; 8];
                     new_entry.value_or_offset[..data.len()].copy_from_slice(&data);
                 } else {
-                    let offset = external_data.get(&entry.tag).unwrap().0;
+                    // Write offset array data right before IFD
+                    writer.align(8)?;
+                    let offset = writer.write_bytes(&data)?;
                     new_entry.value_or_offset = offset.to_le_bytes();
                 }
-            } else if let Some((offset, data)) = external_data.get(&entry.tag) {
-                if data.len() > 8 {
+            } else if entry.tag == 279 || entry.tag == 325 {
+                // StripByteCounts or TileByteCounts
+                if !entry.is_inline() {
+                    let data = reader.read_value_data(entry)?;
+                    writer.align(8)?;
+                    let offset = writer.write_bytes(&data)?;
                     new_entry.value_or_offset = offset.to_le_bytes();
                 }
+            } else if !entry.is_inline() {
+                // Other external data - copy
+                let data = reader.read_value_data(entry)?;
+                writer.align(8)?;
+                let offset = writer.write_bytes(&data)?;
+                new_entry.value_or_offset = offset.to_le_bytes();
             }
 
             new_entries.push(new_entry);
@@ -673,28 +675,35 @@ fn process_file(input_path: &Path, output_path: &Path, metadata_path: Option<&Pa
         // Sort entries by tag (TIFF requirement)
         new_entries.sort_by_key(|e| e.tag);
 
-        // Write IFD (with next_ifd = 0 for now, will update later)
+        // Write IFD (next_ifd will be updated in next pass)
         writer.align(8)?;
         let this_ifd_offset = writer.write_ifd(&new_entries, 0)?;
+        ifd_infos.push((this_ifd_offset, new_entries.len() as u64));
 
-        // Update previous IFD's next pointer
-        if let Some((prev_off, prev_count)) = prev_ifd_offset {
-            writer.update_next_ifd(prev_off, this_ifd_offset, prev_count)?;
-        } else {
-            // First IFD
-            writer.write_first_ifd_offset(this_ifd_offset)?;
-        }
-
-        prev_ifd_offset = Some((this_ifd_offset, new_entries.len() as u64));
-        written_ifds += 1;
-
-        if written_ifds % 1000 == 0 {
-            eprintln!("  Written {} IFDs...", written_ifds);
+        if (ifd_idx + 1) % 1000 == 0 {
+            eprintln!("  Written {} IFDs...", ifd_idx + 1);
         }
     }
 
+    // =======================================================================
+    // PHASE 3: Update IFD chain pointers
+    // =======================================================================
+    eprintln!("Linking IFD chain...");
+
+    // Set first IFD offset in header
+    if let Some(&(first_offset, _)) = ifd_infos.first() {
+        writer.write_first_ifd_offset(first_offset)?;
+    }
+
+    // Link each IFD to the next
+    for i in 0..ifd_infos.len() - 1 {
+        let (this_offset, this_count) = ifd_infos[i];
+        let (next_offset, _) = ifd_infos[i + 1];
+        writer.update_next_ifd(this_offset, next_offset, this_count)?;
+    }
+
     writer.flush()?;
-    eprintln!("Done! Wrote {} IFDs.", written_ifds);
+    eprintln!("Done! Wrote {} IFDs (contiguous at end of file).", ifd_infos.len());
 
     Ok(())
 }
