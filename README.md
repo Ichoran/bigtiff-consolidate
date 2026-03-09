@@ -71,6 +71,12 @@ cargo build --release
 
 The binary will be at `target/release/bigtiff-consolidate`.
 
+### Installing rust / cargo
+
+Follow the instructions on the rust-lang [installation page](https://rust-lang.org/tools/install/). Note that Macs count as "Unix" (or you could `brew install rustup` and `rustup-init` if you have [homebrew](https://brew.sh/), as does Windows with WSL2 (Linux in Windows). You will also need a C build environment: `xcode-select --install` on Mac if you haven't got XCode yet; `build-essentials` or similar package for Linux (including WSL2--ask a LLM about your flavor); or Visual Studio or [MinGW (e.g. via MSYS2)](https://www.msys2.org/) for Windows without WSL2.
+
+There are many variations in how to do this, but each variation is well-understood, so LLMs will tend to give good advice.
+
 ## Output Files
 
 | Mode | Output | Description |
@@ -93,7 +99,7 @@ The binary will be at `target/release/bigtiff-consolidate`.
 ## CAUTION
 
 - Check output validity before deleting valuable data.
-- Not tested on compressed TIFFs.  Don't expect it to work.
+- Not tested on compressed TIFFs.  Don't expect it to work (or to not work--test!).
 - Not tested with custom tags.  If you use atypical tags for anything important, check them!
 
 ## Prevention
